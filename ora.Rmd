@@ -1,0 +1,254 @@
+---
+title: "Over-Representation Analysis with ClusterProfiler"
+author: "Mohammed Khalfan"
+date: "5/15/2019"
+output:
+  html_document:
+    df_print: paged
+df_print: paged
+---
+
+This R Notebook describes the implementation of over-representation analysis using the clusterProfiler package. For more information please see the full documentation here: https://bioconductor.org/packages/release/bioc/vignettes/clusterProfiler/inst/doc/clusterProfiler.html
+
+
+# Install and load packages
+```{r, message=F, warning=F}
+#BiocManager::install("clusterProfiler", version = "3.8")
+#BiocManager::install("pathview")
+#install.packages("wordcloud")
+library(clusterProfiler)
+library(wordcloud)
+```
+
+# Annotations
+I'm using *D melanogaster* data, so I install and load the annotation "org.Dm.eg.db" below. See all annotations available here: http://bioconductor.org/packages/release/BiocViews.html#___OrgDb (there are 19 presently available). 
+
+```{r, message=F, warning=F}
+organism = "org.Dm.eg.db"
+#BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+```
+
+#Prepare Input
+
+```{r}
+# reading in input from deseq2
+df = read.csv("drosphila_example_de.csv", header=TRUE)
+
+# we want the log2 fold change 
+original_gene_list <- df$log2FoldChange
+
+# name the vector
+names(original_gene_list) <- df$X
+
+# omit any NA values 
+gene_list<-na.omit(original_gene_list)
+
+# sort the list in decreasing order (required for clusterProfiler)
+gene_list = sort(gene_list, decreasing = TRUE)
+
+# Exctract significant results (padj < 0.05)
+sig_genes_df = subset(df, padj < 0.05)
+
+# From significant results, we want to filter on log2fold change
+genes <- sig_genes_df$log2FoldChange
+
+# Name the vector
+names(genes) <- sig_genes_df$X
+
+# omit NA values
+genes <- na.omit(genes)
+
+# filter on min log2fold change (log2FoldChange > 2)
+genes <- names(genes)[abs(genes) > 2]
+```
+
+#Create enrichGO object
+Params:  
+  
+**Ontology** Options: ["BP", "MF", "CC"]  
+**keyType** This is the source of the annotation (gene ids). The options vary for each annotation. In the example of *org.Dm.eg.db*, the options are:   
+  
+"ACCNUM"       "ALIAS"        "ENSEMBL"      "ENSEMBLPROT"  "ENSEMBLTRANS" "ENTREZID"      
+"ENZYME"       "EVIDENCE"     "EVIDENCEALL"  "FLYBASE"      "FLYBASECG"    "FLYBASEPROT"   
+"GENENAME"     "GO"           "GOALL"        "MAP"          "ONTOLOGY"     "ONTOLOGYALL"   
+"PATH"         "PMID"         "REFSEQ"       "SYMBOL"       "UNIGENE"      "UNIPROT"  
+  
+Check which options are available with the `keytypes` command, for example `keytypes(org.Dm.eg.db)`. 
+
+## Create the object
+```{r}
+go_enrich <- enrichGO(gene = genes,
+                      universe = names(gene_list),
+                      OrgDb = organism, 
+                      keyType = 'ENSEMBL',
+                      readable = T,
+                      ont = "BP",
+                      pvalueCutoff = 0.05, 
+                      qvalueCutoff = 0.10)
+```
+
+#Output
+##Table of results
+```{r}
+head(go_enrich)
+```
+
+## Upset Plot
+Emphasizes the genes overlapping among different gene sets.
+```{r fig.width=18, fig.height=12}
+#BiocManager::install("enrichplot")
+library(enrichplot)
+upsetplot(go_enrich)
+```
+
+##Wordcloud
+
+```{r fig.width=28, fig.height=26}
+wcdf<-read.table(text=go_enrich$GeneRatio, sep = "/")[1]
+wcdf$term<-go_enrich[,2]
+wordcloud(words = wcdf$term, freq = wcdf$V1, scale=(c(4, .1)), colors=brewer.pal(8, "Dark2"), max.words = 25)
+```
+
+
+##Barplot
+
+```{r echo=TRUE}
+barplot(go_enrich, 
+        drop = TRUE, 
+        showCategory = 10, 
+        title = "GO Biological Pathways",
+        font.size = 8)
+```
+
+##Dotplot
+```{r echo=TRUE}
+dotplot(go_enrich)
+```
+
+##Encrichment plot map:
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+```{r echo=TRUE}
+emapplot(go_enrich)
+
+```
+
+##Enriched GO induced graph:
+
+```{r fig.width=12}
+goplot(go_enrich, showCategory = 10)
+```
+
+##Category Netplot
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories).
+```{r fig.width=12}
+# categorySize can be either 'pvalue' or 'geneNum'
+cnetplot(go_enrich, categorySize="pvalue", foldChange=gene_list)
+```
+
+##KEGG Pathway Enrichment
+For KEGG pathway enrichment using the `gseKEGG()` function, we need to convert id types. We can use the `bitr` function for this (included in clusterProfiler). It is normal for this call to produce some messages / warnings. 
+
+In the `bitr` function, the param `fromType` should be the same as `keyType` from the `gseGO` function above (the annotation source). This param is used again in the next two steps: creating `dedup_ids` and `df2`.  
+
+`toType` in the `bitr` function has to be one of the available options from `keyTypes(org.Dm.eg.db)` and must map to one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot' because `gseKEGG()` only accepts one of these 4 options as it's `keytype` parameter. In the case of org.Dm.eg.db, none of those 4 types are available, but 'ENTREZID' are the same as ncbi-geneid for org.Dm.eg.db so we use this for `toType`. 
+
+As our intial input, we use `original_gene_list` which we created above.
+
+## Prepare Data
+```{r}
+# Convert gene IDs for enrichKEGG function
+# We will lose some genes here because not all IDs will be converted
+ids<-bitr(names(original_gene_list), fromType = "ENSEMBL", toType = "ENTREZID", OrgDb="org.Dm.eg.db")
+
+# remove duplicate IDS (here I use "ENSEMBL", but it should be whatever was selected as keyType)
+dedup_ids = ids[!duplicated(ids[c("ENSEMBL")]),]
+
+# Create a new dataframe df2 which has only the genes which were successfully mapped using the bitr function above
+df2 = df[df$X %in% dedup_ids$ENSEMBL,]
+
+# Create a new column in df2 with the corresponding ENTREZ IDs
+df2$Y = dedup_ids$ENTREZID
+
+# Create a vector of the gene unuiverse
+kegg_gene_list <- df2$log2FoldChange
+
+# Name vector with ENTREZ ids
+names(kegg_gene_list) <- df2$Y
+
+# omit any NA values 
+kegg_gene_list<-na.omit(kegg_gene_list)
+
+# sort the list in decreasing order (required for clusterProfiler)
+kegg_gene_list = sort(kegg_gene_list, decreasing = TRUE)
+
+# Exctract significant results from df2
+kegg_sig_genes_df = subset(df2, padj < 0.05)
+
+# From significant results, we want to filter on log2fold change
+kegg_genes <- kegg_sig_genes_df$log2FoldChange
+
+# Name the vector with the CONVERTED ID!
+names(kegg_genes) <- kegg_sig_genes_df$Y
+
+# omit NA values
+kegg_genes <- na.omit(kegg_genes)
+
+# filter on log2fold change (PARAMETER)
+kegg_genes <- names(kegg_genes)[abs(kegg_genes) > 2]
+
+```
+## Create enrichKEGG object
+**organism** KEGG Organism Code: The full list is here: https://www.genome.jp/kegg/catalog/org_list.html (need the 3 letter code). I define this as `kegg_organism` first, because it is used again below when making the pathview plots.  
+**keyType** one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot'.  
+```{r echo=TRUE}
+kegg_organism = "dme"
+kk <- enrichKEGG(gene=kegg_genes, universe=names(kegg_gene_list),organism=kegg_organism, pvalueCutoff = 0.05, keyType = "ncbi-geneid")
+head(kk)
+```
+
+##Barplot
+```{r echo=TRUE}
+barplot(kk, 
+        showCategory = 10, 
+        title = "Enriched Pathways",
+        font.size = 8)
+```
+
+## Dotplot
+```{r echo=TRUE}
+dotplot(kk, 
+        showCategory = 10, 
+        title = "Enriched Pathways",
+        font.size = 8)
+```
+
+## Category Netplot:
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories).
+```{r fig.width=12}
+# categorySize can be either 'pvalue' or 'geneNum'
+cnetplot(kk, categorySize="pvalue", foldChange=gene_list)
+```
+
+#Pathview
+This will create a PNG and *different* PDF of the enriched KEGG pathway.  
+  
+Params:  
+**gene.data** This is `kegg_gene_list` created above  
+**pathway.id** The user needs to enter this. Enriched pathways + the pathway ID are provided in the gseKEGG output table (above).  
+**species** Same as `organism` above in `gseKEGG`, which we defined as `kegg_organism`
+**gene.idtype** The index number (first index is 1) correspoding to your keytype from this list `gene.idtype.list`
+```{r, message=F, warning=F, echo = TRUE}
+library(pathview)
+
+# Produce the native KEGG plot (PNG)
+dme <- pathview(gene.data=gene_list, pathway.id="dme04080", species = "dme", gene.idtype=gene.idtype.list[3])
+
+# Produce a different plot (PDF) (not displayed here)
+dme <- pathview(gene.data=gene_list, pathway.id="dme04080", species = "dme", gene.idtype=gene.idtype.list[3], kegg.native = F)
+```
+```{r pressure, echo=TRUE, fig.cap="KEGG Native Enriched Pathway Plot", out.width = '100%'}
+knitr::include_graphics("dme04080.pathview.png")
+```
+
+
